@@ -2001,6 +2001,192 @@ async fn test_cache_pool_controls_stat_list_and_evict_size() {
 }
 
 #[tokio::test]
+async fn test_runtime_capacity_is_shared_and_updates_pressure_and_stats() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    options.capacity_bytes = 64 * 1024;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let clone = backend.clone();
+    let file = backend
+        .open_cache_only("runtime-limit", 8192)
+        .await
+        .expect("open");
+    file.refill_from_slice(0, &[0x5a; 8192])
+        .await
+        .expect("fill");
+    assert_eq!(backend.capacity_bytes(), 64 * 1024);
+    assert!(!backend.state.is_full.load(Ordering::Relaxed));
+
+    clone.set_capacity_bytes(8192);
+    assert_eq!(backend.capacity_bytes(), 8192);
+    assert_eq!(backend.stat_path(None).expect("pool stat").total_size, 2);
+    assert!(backend.state.is_full.load(Ordering::Relaxed));
+
+    backend.set_capacity_bytes(64 * 1024);
+    assert_eq!(clone.capacity_bytes(), 64 * 1024);
+    assert_eq!(
+        clone.stat_path(Some("/")).expect("pool stat").total_size,
+        16
+    );
+    // A file's capacity is its logical size, independent of the pool limit.
+    assert_eq!(
+        clone
+            .stat_path(Some("runtime-limit"))
+            .expect("file stat")
+            .total_size,
+        2
+    );
+    assert!(!backend.state.is_full.load(Ordering::Relaxed));
+}
+
+#[tokio::test]
+async fn test_runtime_capacity_shrink_background_gc_preserves_open_entries() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let open = backend
+        .open_cache_only("keep-open", 4096)
+        .await
+        .expect("open");
+    open.refill_from_slice(0, &[0x5a; 4096])
+        .await
+        .expect("fill open");
+    for key in ["idle-a", "idle-b"] {
+        let idle = backend.open_cache_only(key, 4096).await.expect("open idle");
+        idle.refill_from_slice(0, &[0x6b; 4096])
+            .await
+            .expect("fill idle");
+    }
+    assert_eq!(backend.stats().bytes_used, 3 * 4096);
+
+    backend.set_capacity_bytes(8192);
+    // No explicit eviction call: the existing periodic worker must see the update.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while backend.stats().bytes_used != 4096 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("periodic GC after shrinking capacity");
+    assert!(backend.file_stats("idle-a").is_none());
+    assert!(backend.file_stats("idle-b").is_none());
+    assert_eq!(
+        open.read_at(0, 4096).await.expect("read open").as_ref(),
+        &[0x5a; 4096]
+    );
+
+    // Zero still cannot evict an open entry, even when all its bytes exceed the limit.
+    backend.set_capacity_bytes(0);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().bytes_used, 4096);
+    drop(open);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().bytes_used, 0);
+}
+
+#[tokio::test]
+async fn test_runtime_capacity_growth_keeps_idle_cache_and_allows_refill() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    options.capacity_bytes = 8192;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let a = backend
+        .open_cache_only("grow-a", 4096)
+        .await
+        .expect("open a");
+    let b = backend
+        .open_cache_only("grow-b", 4096)
+        .await
+        .expect("open b");
+    a.refill_from_slice(0, &[1; 4096]).await.expect("fill a");
+    b.refill_from_slice(0, &[2; 4096]).await.expect("fill b");
+    assert!(backend.state.is_full.load(Ordering::Relaxed));
+
+    backend.set_capacity_bytes(64 * 1024);
+    drop(a);
+    drop(b);
+    backend.eviction_inner().await;
+    assert_eq!(backend.stats().bytes_used, 8192);
+    assert!(backend.file_stats("grow-a").is_some());
+    assert!(backend.file_stats("grow-b").is_some());
+
+    let c = backend
+        .open_cache_only("grow-c", 4096)
+        .await
+        .expect("open c");
+    c.refill_from_slice(0, &[3; 4096])
+        .await
+        .expect("fill beyond old capacity");
+    assert_eq!(backend.stats().bytes_used, 3 * 4096);
+}
+
+#[tokio::test]
+async fn test_runtime_capacity_zero_and_restore_affect_existing_file() {
+    let tmp = tempdir().expect("create tempdir");
+    let mut options = test_options(tmp.path());
+    options.block_size = 4096;
+    let backend = FileCacheBackend::with_options(options)
+        .await
+        .expect("backend");
+    let source = Arc::new(MockSource::new(vec![0x5a; 3 * 4096], Duration::ZERO));
+    let background_source: Arc<dyn VirtualFile> = source.clone();
+    let file = backend
+        .open_file("toggle-refill", source.clone())
+        .await
+        .expect("open");
+    let _ = file.read_at(0, 4096).await.expect("warm block");
+    assert_eq!(backend.stats().bytes_used, 4096);
+
+    backend.set_capacity_bytes(0);
+    let before_hit = source.read_calls();
+    let _ = file
+        .read_at(0, 4096)
+        .await
+        .expect("cached hit while disabled");
+    assert_eq!(source.read_calls(), before_hit);
+    let _ = file
+        .read_at(4096, 4096)
+        .await
+        .expect("source read while disabled");
+    assert_eq!(backend.stats().bytes_used, 4096);
+    assert_eq!(file.query(4096, 4096).await.expect("uncached block"), 4096);
+    let err = file
+        .refill_from_slice(4096, &[0x5a; 4096])
+        .await
+        .expect_err("disabled writes");
+    assert_eq!(err.downcast_ref::<Errno>(), Some(&Errno::ENOSPC));
+    let err = file
+        .background_refill_range(&background_source, 3 * 4096, 2, 1)
+        .await
+        .expect_err("disabled background fill");
+    assert_eq!(err.downcast_ref::<Errno>(), Some(&Errno::ENOSPC));
+
+    backend.set_capacity_bytes(64 * 1024);
+    let mut buf = [0; 4096];
+    assert_eq!(
+        file.read_at_into(4096, &mut buf)
+            .await
+            .expect("refill after enabling"),
+        4096
+    );
+    assert_eq!(buf, [0x5a; 4096]);
+    file.background_refill_range(&background_source, 3 * 4096, 2, 1)
+        .await
+        .expect("background refill after enabling");
+    assert_eq!(backend.stats().bytes_used, 3 * 4096);
+    assert_eq!(file.query(4096, 2 * 4096).await.expect("cached blocks"), 0);
+}
+
+#[tokio::test]
 async fn test_overlaybd_watermark_formula_alignment() {
     let tmp = tempdir().expect("create tempdir");
     let cap = 4 * GIB;

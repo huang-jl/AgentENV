@@ -26,6 +26,8 @@ use tokio::sync::Notify;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileCacheBackendOptions {
     pub cache_dir: PathBuf,
+    /// Initial cache data capacity; use `FileCacheBackend::set_capacity_bytes`
+    /// to change the limit after construction.
     pub capacity_bytes: u64,
     /// The refill unit and management unit of cache
     pub block_size: u64,
@@ -171,6 +173,7 @@ impl CacheSlot {
 pub(crate) struct BackendState {
     pub(crate) cache_entries: DashMap<String, CacheSlot>,
     pub(crate) current_bytes: AtomicU64,
+    capacity_bytes: AtomicU64,
     pub(crate) is_full: AtomicBool,
     pub(crate) pressure_lock: Mutex<()>,
     pub(crate) evict_global: AtomicU64,
@@ -178,10 +181,11 @@ pub(crate) struct BackendState {
 }
 
 impl BackendState {
-    fn new() -> Self {
+    fn new(capacity_bytes: u64) -> Self {
         Self {
             cache_entries: DashMap::new(),
             current_bytes: AtomicU64::new(0),
+            capacity_bytes: AtomicU64::new(capacity_bytes),
             is_full: AtomicBool::new(false),
             pressure_lock: Mutex::new(()),
             evict_global: AtomicU64::new(0),
@@ -190,7 +194,7 @@ impl BackendState {
     }
 
     pub(crate) async fn load_from_disk(options: &FileCacheBackendOptions) -> Result<Self> {
-        let state = Self::new();
+        let state = Self::new(options.capacity_bytes);
         std::fs::create_dir_all(&options.cache_dir)?;
         for item in std::fs::read_dir(&options.cache_dir)? {
             let item = item?;
@@ -221,7 +225,7 @@ impl BackendState {
         }
         let disk = FileCacheBackend::capture_disk_pressure(options);
         let _pressure_guard = state.pressure_lock.lock();
-        FileCacheBackend::publish_pressure_locked(&state, options, disk);
+        FileCacheBackend::publish_pressure_locked(&state, disk);
         drop(_pressure_guard);
         Ok(state)
     }
@@ -279,8 +283,12 @@ enum EvictionCounter {
 
 #[derive(Debug, Clone, Copy, Default)]
 struct DiskPressureSnapshot {
+    /// Bytes to reclaim to restore DEFAULT_DISK_AVAIL_BYTES of free space on
+    /// the cache filesystem: the target minus sampled available bytes,
+    /// saturating at zero. This is a requested amount, not bytes already freed,
+    /// and is independent of the cache pool's configured capacity.
     evict_bytes: u64,
-    suppress_cache_pressure: bool,
+    fs_capacity_bytes: Option<u64>,
 }
 
 impl FileCacheBackend {
@@ -316,6 +324,27 @@ impl FileCacheBackend {
 
     pub async fn from_cache_config(cfg: &CacheConfig) -> Result<Self> {
         Self::with_options(FileCacheBackendOptions::from_cache_config(cfg)?).await
+    }
+
+    /// Return the current cache data capacity in bytes, shared by all clones.
+    pub fn capacity_bytes(&self) -> u64 {
+        self.state.capacity_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Change the cache data capacity and refresh refill pressure immediately.
+    ///
+    /// Reclamation uses the existing eviction checks and periodic worker; this
+    /// method does not evict entries. Open or refilling entries remain protected.
+    /// A refill or eviction pass already in progress may finish under the old
+    /// limit. Zero disables new cache fills without invalidating cached reads.
+    /// The change is shared by all clones and is not persisted across restarts.
+    pub fn set_capacity_bytes(&self, capacity_bytes: u64) {
+        let disk = Self::capture_disk_pressure(&self.options);
+        let _pressure_guard = self.state.pressure_lock.lock();
+        self.state
+            .capacity_bytes
+            .store(capacity_bytes, Ordering::Relaxed);
+        Self::publish_pressure_locked(&self.state, disk);
     }
 
     // -------------------------------------------------------------------
@@ -431,8 +460,7 @@ impl FileCacheBackend {
         ratio_mark.max(free_space_mark)
     }
 
-    fn risk_mark_for_options(options: &FileCacheBackendOptions) -> u64 {
-        let capacity = options.capacity_bytes;
+    fn risk_mark_for_capacity(capacity: u64) -> u64 {
         let water_mark = Self::calc_water_mark(capacity);
         capacity
             .saturating_sub(EVICTION_MARK_BYTES)
@@ -441,51 +469,44 @@ impl FileCacheBackend {
 
     #[cfg(test)]
     pub(crate) fn risk_mark(&self) -> u64 {
-        Self::risk_mark_for_options(&self.options)
+        Self::risk_mark_for_capacity(self.capacity_bytes())
     }
 
     fn capture_disk_pressure(options: &FileCacheBackendOptions) -> DiskPressureSnapshot {
-        let water_mark = Self::calc_water_mark(options.capacity_bytes);
         let Ok(space) = sys::fs_space(&options.cache_dir) else {
             return DiskPressureSnapshot::default();
         };
-        if space.avail_bytes < DEFAULT_DISK_AVAIL_BYTES {
-            DiskPressureSnapshot {
-                evict_bytes: DEFAULT_DISK_AVAIL_BYTES.saturating_sub(space.avail_bytes),
-                suppress_cache_pressure: false,
-            }
-        } else {
-            DiskPressureSnapshot {
-                evict_bytes: 0,
-                suppress_cache_pressure: space.capacity_bytes <= water_mark,
-            }
+        DiskPressureSnapshot {
+            evict_bytes: DEFAULT_DISK_AVAIL_BYTES.saturating_sub(space.avail_bytes),
+            fs_capacity_bytes: Some(space.capacity_bytes),
         }
     }
 
-    fn pressure_evict_target_for_options(
-        options: &FileCacheBackendOptions,
+    fn pressure_evict_target(
+        capacity_bytes: u64,
         current_bytes: u64,
         disk: DiskPressureSnapshot,
     ) -> u64 {
-        let water_mark = Self::calc_water_mark(options.capacity_bytes);
-        let evict_by_cache = if disk.suppress_cache_pressure {
+        let water_mark = Self::calc_water_mark(capacity_bytes);
+        // Derive this from the current capacity, not the capacity at the time
+        // disk space was sampled (before taking pressure_lock).
+        let suppress_cache_pressure = disk.evict_bytes == 0
+            && disk
+                .fs_capacity_bytes
+                .is_some_and(|capacity| capacity <= water_mark);
+        let evict_by_cache = if suppress_cache_pressure {
             0
-        } else if current_bytes >= water_mark {
-            current_bytes.saturating_sub(water_mark)
         } else {
-            0
+            current_bytes.saturating_sub(water_mark)
         };
         evict_by_cache.max(disk.evict_bytes)
     }
 
-    fn publish_pressure_locked(
-        state: &BackendState,
-        options: &FileCacheBackendOptions,
-        disk: DiskPressureSnapshot,
-    ) {
+    fn publish_pressure_locked(state: &BackendState, disk: DiskPressureSnapshot) {
+        let capacity = state.capacity_bytes.load(Ordering::Relaxed);
         let current_bytes = state.current_bytes.load(Ordering::Relaxed);
-        let pressure = Self::pressure_evict_target_for_options(options, current_bytes, disk) > 0
-            || current_bytes >= Self::risk_mark_for_options(options);
+        let pressure = Self::pressure_evict_target(capacity, current_bytes, disk) > 0
+            || current_bytes >= Self::risk_mark_for_capacity(capacity);
         state.is_full.store(pressure, Ordering::Relaxed);
     }
 
@@ -493,7 +514,7 @@ impl FileCacheBackend {
         let disk = Self::capture_disk_pressure(options);
         let _pressure_guard = state.pressure_lock.lock();
         state.current_bytes.fetch_add(bytes, Ordering::Relaxed);
-        Self::publish_pressure_locked(state, options, disk);
+        Self::publish_pressure_locked(state, disk);
     }
 
     fn subtract_current_bytes_for(
@@ -504,7 +525,7 @@ impl FileCacheBackend {
         let disk = Self::capture_disk_pressure(options);
         let _pressure_guard = state.pressure_lock.lock();
         state.current_bytes.fetch_sub(bytes, Ordering::Relaxed);
-        Self::publish_pressure_locked(state, options, disk);
+        Self::publish_pressure_locked(state, disk);
     }
 
     pub(crate) fn add_current_bytes(&self, bytes: u64) {
@@ -594,15 +615,15 @@ impl FileCacheBackend {
 
     async fn eviction_inner_for(state: &BackendState, options: &FileCacheBackendOptions) {
         let disk = Self::capture_disk_pressure(options);
-        let current_bytes = state.current_bytes.load(Ordering::Relaxed);
-        let mut actual_evict =
-            Self::pressure_evict_target_for_options(options, current_bytes, disk);
+        let mut actual_evict = {
+            let _pressure_guard = state.pressure_lock.lock();
+            let capacity = state.capacity_bytes.load(Ordering::Relaxed);
+            let current_bytes = state.current_bytes.load(Ordering::Relaxed);
+            Self::publish_pressure_locked(state, disk);
+            Self::pressure_evict_target(capacity, current_bytes, disk)
+        };
 
         if actual_evict > 0 {
-            let _pressure_guard = state.pressure_lock.lock();
-            state.is_full.store(true, Ordering::Relaxed);
-            drop(_pressure_guard);
-
             for cache_id in Self::evictable_cache_ids_by_lru(state) {
                 if actual_evict == 0 {
                     break;
@@ -619,7 +640,7 @@ impl FileCacheBackend {
         // stale initial target (including when the initial target was zero).
         let final_disk = Self::capture_disk_pressure(options);
         let _pressure_guard = state.pressure_lock.lock();
-        Self::publish_pressure_locked(state, options, final_disk);
+        Self::publish_pressure_locked(state, final_disk);
     }
 
     pub(crate) async fn eviction_inner(&self) {
@@ -718,7 +739,7 @@ impl FileCacheBackend {
         let (used_bytes, total_bytes) = match pathname {
             None | Some("/") => (
                 self.state.current_bytes.load(Ordering::Relaxed),
-                self.options.capacity_bytes,
+                self.capacity_bytes(),
             ),
             Some(path) => {
                 let key = self.transform_store_key(path);

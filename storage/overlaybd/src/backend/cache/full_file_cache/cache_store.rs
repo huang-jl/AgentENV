@@ -76,7 +76,7 @@ impl FileCacheBackend {
 
         // Pre-fill: attempt to refill the range if there are holes.
         let mut did_prefill = false;
-        if self.options.capacity_bytes > 0 && !cache_only && allow_refill {
+        if self.capacity_bytes() > 0 && !cache_only && allow_refill {
             if let Some(source) = source {
                 if let Some(entry) = self.get_cache_entry(cache_id) {
                     if self
@@ -207,7 +207,7 @@ impl FileCacheBackend {
 
         // Pre-fill: attempt to refill the range if there are holes.
         let mut did_prefill = false;
-        if self.options.capacity_bytes > 0 && !cache_only && allow_refill {
+        if self.capacity_bytes() > 0 && !cache_only && allow_refill {
             if let Some(source) = source {
                 if let Some(entry) = self.get_cache_entry(cache_id) {
                     if self
@@ -304,7 +304,7 @@ impl FileCacheBackend {
         let cache_only =
             (ctx.rw_flags & RW_V2_CACHE_ONLY) != 0 || (ctx.open_flags & O_CACHE_ONLY) != 0;
 
-        if self.options.capacity_bytes > 0 {
+        if self.capacity_bytes() > 0 {
             let Some(source) = source else {
                 bail!("cache miss without source file");
             };
@@ -583,7 +583,7 @@ impl FileCacheBackend {
         }
 
         // Check capacity.
-        if self.options.capacity_bytes == 0 {
+        if self.capacity_bytes() == 0 {
             return Err(Errno::ENOSPC.into());
         }
         if self.state.is_full.load(Ordering::Relaxed) {
@@ -651,7 +651,7 @@ impl FileCacheBackend {
         if capped == 0 {
             return Ok(0);
         }
-        if self.options.capacity_bytes == 0 {
+        if self.capacity_bytes() == 0 {
             return Ok(capped);
         }
 
@@ -769,7 +769,7 @@ impl FileCacheBackend {
             }
 
             // Check capacity.
-            if self.options.capacity_bytes == 0 {
+            if self.capacity_bytes() == 0 {
                 return Err(Errno::ENOSPC.into());
             }
             if self.state.is_full.load(Ordering::Relaxed) {
@@ -1101,8 +1101,7 @@ impl CachedFile {
 
         // Back off while the cache is full: the task-level retry loop turns
         // this into a bounded ENOSPC wait instead of churning eviction.
-        if self.backend.options.capacity_bytes == 0
-            || self.backend.state.is_full.load(Ordering::Relaxed)
+        if self.backend.capacity_bytes() == 0 || self.backend.state.is_full.load(Ordering::Relaxed)
         {
             return Err(Errno::ENOSPC.into());
         }
