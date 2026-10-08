@@ -11,7 +11,7 @@ use std::future::Future;
 use std::os::fd::AsFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use zerocopy::U64;
 
@@ -21,6 +21,14 @@ use super::super::meta::{
 use super::cache_pool::FileCacheBackendOptions;
 use crate::sys;
 use storage_util::MMapRegion;
+
+// Query once for all cache pools. The host page size can differ from the
+// cache's 4 KiB block alignment (e.g. 16 KiB on native Apple Silicon macOS).
+static MMAP_PAGE_SIZE: LazyLock<u64> = LazyLock::new(|| {
+    // POSIX guarantees a positive page size on Linux and macOS.
+    // SAFETY: sysconf has no pointer arguments or additional preconditions.
+    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+});
 
 /// The core per-cache-entry object. One per remote file (keyed by cache_id).
 ///
@@ -182,6 +190,18 @@ impl<'a> Future for AcquireRefillFut<'a> {
 }
 
 impl CacheEntry {
+    fn account_mapping(region: &mut MMapRegion, total: Arc<AtomicU64>) -> Result<()> {
+        let bytes = (region.len() as u64).next_multiple_of(*MMAP_PAGE_SIZE);
+        let on_unmap_total = total.clone();
+        region.on_unmap(move || {
+            on_unmap_total.fetch_sub(bytes, Ordering::Relaxed);
+        })?;
+        // The mapping is still exclusively owned here. Count it only after
+        // registering the callback, before sharing it with any readers.
+        total.fetch_add(bytes, Ordering::Relaxed);
+        Ok(())
+    }
+
     // -----------------------------------------------------------------------
     // Construction
     // -----------------------------------------------------------------------
@@ -197,6 +217,7 @@ impl CacheEntry {
         source_size: u64,
         options: &FileCacheBackendOptions,
         paths: EntryPaths,
+        mmap_bytes: Arc<AtomicU64>,
     ) -> Result<Arc<Self>> {
         if source_size == 0 {
             bail!("cannot create cache entry with source_size == 0");
@@ -214,8 +235,9 @@ impl CacheEntry {
         // Make it a sparse file of the right size.
         data_file.set_len(source_size)?;
 
-        let mem_region = MMapRegion::from_fd(&data_file, 0, source_size as usize)
+        let mut mem_region = MMapRegion::from_fd(&data_file, 0, source_size as usize)
             .map_err(|e| anyhow!("mmap cache data file: {e}"))?;
+        Self::account_mapping(&mut mem_region, mmap_bytes)?;
 
         Ok(Arc::new(Self {
             cache_id,
@@ -246,6 +268,7 @@ impl CacheEntry {
         cache_id: String,
         paths: EntryPaths,
         options: &FileCacheBackendOptions,
+        mmap_bytes: Arc<AtomicU64>,
     ) -> Result<Arc<Self>> {
         // Verify data file exists
         if !paths.meta_path.try_exists()? {
@@ -294,8 +317,9 @@ impl CacheEntry {
             );
         }
 
-        let mem_region = MMapRegion::from_fd(&data_file, 0, source_size as usize)
+        let mut mem_region = MMapRegion::from_fd(&data_file, 0, source_size as usize)
             .map_err(|e| anyhow!("mmap cache data file on load: {e}"))?;
+        Self::account_mapping(&mut mem_region, mmap_bytes)?;
 
         Ok(Arc::new(Self {
             cache_id,

@@ -110,13 +110,17 @@ impl FileCacheBackendOptions {
 }
 
 // ---------------------------------------------------------------------------
-// Public stat types (unchanged API)
+// Public stat types
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheStats {
     pub entries: usize,
     pub bytes_used: u64,
+    /// Page-rounded virtual bytes mapped by this backend, including mappings
+    /// kept alive by returned Bytes after their cache entries are evicted.
+    /// Independent of cached data bytes, physical memory, and disk allocation.
+    pub mmap_bytes: u64,
     pub hits: u64,
     pub misses: u64,
     pub refills: u64,
@@ -173,6 +177,7 @@ impl CacheSlot {
 pub(crate) struct BackendState {
     pub(crate) cache_entries: DashMap<String, CacheSlot>,
     pub(crate) current_bytes: AtomicU64,
+    pub(crate) mmap_bytes: Arc<AtomicU64>,
     capacity_bytes: AtomicU64,
     pub(crate) is_full: AtomicBool,
     pub(crate) pressure_lock: Mutex<()>,
@@ -185,6 +190,7 @@ impl BackendState {
         Self {
             cache_entries: DashMap::new(),
             current_bytes: AtomicU64::new(0),
+            mmap_bytes: Arc::new(AtomicU64::new(0)),
             capacity_bytes: AtomicU64::new(capacity_bytes),
             is_full: AtomicBool::new(false),
             pressure_lock: Mutex::new(()),
@@ -208,7 +214,14 @@ impl BackendState {
                 continue;
             }
             let paths = EntryPaths::new(&options.cache_dir, &cache_id);
-            match CacheEntry::load_from_disk(cache_id.clone(), paths, options).await {
+            match CacheEntry::load_from_disk(
+                cache_id.clone(),
+                paths,
+                options,
+                state.mmap_bytes.clone(),
+            )
+            .await
+            {
                 Ok(entry) => {
                     let bytes = entry.total_cached_bytes();
                     state.current_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -670,6 +683,7 @@ impl FileCacheBackend {
         let mut stats = CacheStats {
             entries: 0,
             bytes_used: self.state.current_bytes.load(Ordering::Relaxed),
+            mmap_bytes: self.state.mmap_bytes.load(Ordering::Relaxed),
             hits: 0,
             misses: 0,
             refills: 0,
@@ -927,6 +941,7 @@ impl FileCacheBackend {
             source_size,
             &self.options,
             new_paths,
+            self.state.mmap_bytes.clone(),
         )?;
 
         // Move bitmap from old entry.
@@ -1168,6 +1183,7 @@ impl FileCacheBackend {
                 source_size,
                 &self.options,
                 paths,
+                self.state.mmap_bytes.clone(),
             )?;
             let slot_ref = self
                 .state

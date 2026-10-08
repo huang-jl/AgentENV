@@ -2001,6 +2001,135 @@ async fn test_cache_pool_controls_stat_list_and_evict_size() {
 }
 
 #[tokio::test]
+async fn test_mmap_stats_count_sparse_files_and_reused_handles() {
+    let tmp = tempdir().expect("create tempdir");
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend");
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    assert_eq!(backend.stats().mmap_bytes, 0);
+    backend
+        .open_cache_only("empty", 0)
+        .await
+        .expect_err("zero size");
+    assert_eq!(backend.stats().mmap_bytes, 0);
+
+    let file = backend
+        .open_cache_only("sparse", page_size + 1)
+        .await
+        .expect("open sparse");
+    assert_eq!(backend.stats().mmap_bytes, 2 * page_size);
+    assert_eq!(backend.stats().bytes_used, 0);
+    let clone = backend.clone();
+    let other_handle = clone
+        .open_cache_only("sparse", page_size + 1)
+        .await
+        .expect("reopen");
+    assert_eq!(clone.stats().mmap_bytes, 2 * page_size);
+    drop(other_handle);
+    drop(file);
+    // Closing handles does not remove the entry or its mapping from the pool.
+    assert_eq!(backend.stats().mmap_bytes, 2 * page_size);
+    backend.evict_global().await.expect("remove idle mapping");
+    assert_eq!(backend.stats().mmap_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_mmap_stats_follow_bytes_after_eviction() {
+    let tmp = tempdir().expect("create tempdir");
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend");
+    let file = backend
+        .open_cache_only("held-bytes", 4096)
+        .await
+        .expect("open");
+    file.refill_from_slice(0, &[0x5a; 4096])
+        .await
+        .expect("fill");
+    let bytes = file.read_at(0, 4096).await.expect("read");
+    let other_bytes = bytes.clone();
+    let mapped = backend.stats().mmap_bytes;
+    assert!(mapped >= 4096);
+    drop(file);
+    backend.evict_global().await.expect("evict");
+    let stats = backend.stats();
+    assert_eq!(stats.entries, 0);
+    assert_eq!(stats.bytes_used, 0);
+    assert_eq!(stats.mmap_bytes, mapped);
+
+    // The accounting must also survive the backend, without retaining it.
+    let total = backend.state.mmap_bytes.clone();
+    drop(backend);
+    drop(bytes);
+    assert_eq!(total.load(Ordering::Relaxed), mapped);
+    drop(other_bytes);
+    assert_eq!(total.load(Ordering::Relaxed), 0);
+}
+
+#[tokio::test]
+async fn test_mmap_stats_do_not_decrease_when_only_blocks_are_evicted() {
+    let tmp = tempdir().expect("create tempdir");
+    let backend = FileCacheBackend::with_options(test_options(tmp.path()))
+        .await
+        .expect("backend");
+    let file = backend.open_cache_only("punch", 4096).await.expect("open");
+    file.refill_from_slice(0, &[0x5a; 4096])
+        .await
+        .expect("fill");
+    let mapped = backend.stats().mmap_bytes;
+    file.evict_all().await.expect("punch cached blocks");
+    assert_eq!(backend.stats().bytes_used, 0);
+    assert_eq!(backend.stats().mmap_bytes, mapped);
+    drop(file);
+    backend.evict_global().await.expect("remove mapping");
+    assert_eq!(backend.stats().mmap_bytes, 0);
+}
+
+#[tokio::test]
+async fn test_mmap_stats_restore_and_release_with_backend() {
+    let tmp = tempdir().expect("create tempdir");
+    let options = test_options(tmp.path());
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let backend = FileCacheBackend::with_options(options.clone())
+        .await
+        .expect("backend");
+    let file = backend
+        .open_cache_only("persist-mapping", page_size + 1)
+        .await
+        .expect("open");
+    file.sync().await.expect("persist sparse entry");
+    let total = backend.state.mmap_bytes.clone();
+    drop(file);
+    drop(backend);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while total.load(Ordering::Relaxed) != 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("release backend mappings");
+
+    let restored = FileCacheBackend::with_options(options)
+        .await
+        .expect("restore");
+    assert_eq!(restored.stats().entries, 1);
+    assert_eq!(restored.stats().bytes_used, 0);
+    assert_eq!(restored.stats().mmap_bytes, 2 * page_size);
+    // Rename creates a replacement mapping and must retire the old charge.
+    restored
+        .rename_store_key("persist-mapping", "renamed-mapping")
+        .await
+        .expect("rename");
+    assert_eq!(restored.stats().mmap_bytes, 2 * page_size);
+    restored
+        .evict_global()
+        .await
+        .expect("remove restored mapping");
+    assert_eq!(restored.stats().mmap_bytes, 0);
+}
+
+#[tokio::test]
 async fn test_runtime_capacity_is_shared_and_updates_pressure_and_stats() {
     let tmp = tempdir().expect("create tempdir");
     let mut options = test_options(tmp.path());
