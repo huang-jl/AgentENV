@@ -190,6 +190,11 @@ impl<'a> Future for AcquireRefillFut<'a> {
 }
 
 impl CacheEntry {
+    /// Page-rounded size of this entry's mapping, even if readers also hold it.
+    pub(crate) fn mmap_bytes(&self) -> u64 {
+        (self.mem_region.len() as u64).next_multiple_of(*MMAP_PAGE_SIZE)
+    }
+
     fn account_mapping(region: &mut MMapRegion, total: Arc<AtomicU64>) -> Result<()> {
         let bytes = (region.len() as u64).next_multiple_of(*MMAP_PAGE_SIZE);
         let on_unmap_total = total.clone();
