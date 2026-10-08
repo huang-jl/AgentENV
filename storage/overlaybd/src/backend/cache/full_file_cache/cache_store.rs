@@ -1549,7 +1549,13 @@ impl VirtualFile for CachedFile {
         }
         // Checkpoint metadata on explicit sync.
         if let Some(entry) = self.backend.get_cache_entry(&self.cache_id) {
-            let _ = entry.checkpoint().await;
+            let _ = entry.checkpoint().await.inspect_err(|err| {
+                tracing::warn!(
+                    cache_id = %self.cache_id,
+                    ?err,
+                    "failed to checkpoint cache entry on sync"
+                )
+            });
         }
         Ok(())
     }

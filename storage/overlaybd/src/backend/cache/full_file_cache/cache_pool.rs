@@ -249,6 +249,15 @@ impl BackendState {
         let _pressure_guard = state.pressure_lock.lock();
         FileCacheBackend::publish_pressure_locked(&state, disk);
         drop(_pressure_guard);
+        tracing::info!(
+            cache_dir = %options.cache_dir.display(),
+            entries = state.cache_entries.len(),
+            cached_bytes = state.current_bytes.load(Ordering::Relaxed),
+            mmap_bytes = state.mmap_bytes.load(Ordering::Relaxed),
+            capacity_bytes = options.capacity_bytes,
+            mmap_capacity_bytes = options.mmap_capacity_bytes,
+            "loaded file cache from disk"
+        );
         Ok(state)
     }
 }
@@ -372,10 +381,17 @@ impl FileCacheBackend {
     pub fn set_capacity_bytes(&self, capacity_bytes: u64) {
         let disk = Self::capture_disk_pressure(&self.options);
         let _pressure_guard = self.state.pressure_lock.lock();
-        self.state
+        let old_capacity_bytes = self
+            .state
             .capacity_bytes
-            .store(capacity_bytes, Ordering::Relaxed);
+            .swap(capacity_bytes, Ordering::Relaxed);
         Self::publish_pressure_locked(&self.state, disk);
+        drop(_pressure_guard);
+        tracing::info!(
+            old_capacity_bytes,
+            capacity_bytes,
+            "updated file cache capacity"
+        );
     }
 
     /// Return the current mmap capacity in bytes, shared by all clones.
@@ -391,9 +407,15 @@ impl FileCacheBackend {
     /// existing mapping uses no additional virtual address space. Changes are
     /// shared by all clones and are not persisted across restarts.
     pub fn set_mmap_capacity_bytes(&self, capacity_bytes: u64) {
-        self.state
+        let old_capacity_bytes = self
+            .state
             .mmap_capacity_bytes
-            .store(capacity_bytes, Ordering::Relaxed);
+            .swap(capacity_bytes, Ordering::Relaxed);
+        tracing::info!(
+            old_capacity_bytes,
+            capacity_bytes,
+            "updated file cache mmap capacity"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -415,14 +437,18 @@ impl FileCacheBackend {
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .build();
+                    .build()
+                    .inspect_err(
+                        |err| tracing::error!(%err, "failed to build file cache eviction runtime"),
+                    );
                 let Ok(runtime) = runtime else {
                     return;
                 };
                 runtime.block_on(async move {
                     Self::periodic_eviction_loop(weak_state, options).await;
                 });
-            });
+            })
+            .inspect_err(|err| tracing::error!(%err, "failed to spawn file cache eviction thread"));
     }
 
     /// Start a background task that wake up every [DEFAULT_CHECKPOINT_PERIOD],
@@ -449,7 +475,10 @@ impl FileCacheBackend {
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
-                    .build();
+                    .build()
+                    .inspect_err(|err| {
+                        tracing::error!(%err, "failed to build file cache checkpoint runtime")
+                    });
                 let Ok(runtime) = runtime else {
                     return;
                 };
@@ -463,7 +492,10 @@ impl FileCacheBackend {
                         Self::checkpoint_dirty_entries(&state).await;
                     }
                 });
-            });
+            })
+            .inspect_err(
+                |err| tracing::error!(%err, "failed to spawn file cache checkpoint thread"),
+            );
     }
 
     async fn checkpoint_dirty_entries(state: &BackendState) {
@@ -481,7 +513,13 @@ impl FileCacheBackend {
             })
             .collect::<Vec<_>>();
         for entry in dirty_entries {
-            let _ = entry.checkpoint().await;
+            let _ = entry.checkpoint().await.inspect_err(|err| {
+                tracing::warn!(
+                    cache_id = %entry.cache_id,
+                    ?err,
+                    "failed to checkpoint cache entry"
+                )
+            });
         }
     }
 
@@ -562,7 +600,15 @@ impl FileCacheBackend {
         let current_bytes = state.current_bytes.load(Ordering::Relaxed);
         let pressure = Self::pressure_evict_target(capacity, current_bytes, disk) > 0
             || current_bytes >= Self::risk_mark_for_capacity(capacity);
-        state.is_full.store(pressure, Ordering::Relaxed);
+        if state.is_full.swap(pressure, Ordering::Relaxed) != pressure {
+            tracing::debug!(
+                full = pressure,
+                cached_bytes = current_bytes,
+                capacity_bytes = capacity,
+                disk_evict_bytes = disk.evict_bytes,
+                "file cache refill pressure changed"
+            );
+        }
     }
 
     fn add_current_bytes_for(state: &BackendState, options: &FileCacheBackendOptions, bytes: u64) {
@@ -640,7 +686,13 @@ impl FileCacheBackend {
 
         let released = match entry.evict_all_blocks().await {
             Ok(bytes) => bytes,
-            Err(_) => {
+            Err(err) => {
+                tracing::warn!(
+                    cache_id,
+                    reason = ?counter,
+                    ?err,
+                    "failed to evict cache entry; keeping it active"
+                );
                 if let Some(mut slot_ref) = state.cache_entries.get_mut(cache_id) {
                     *slot_ref.value_mut() = CacheSlot::Active(entry);
                 }
@@ -648,7 +700,7 @@ impl FileCacheBackend {
                 return EvictedBytes::default();
             }
         };
-        let _ = tokio::fs::remove_dir_all(&entry.paths.dir).await;
+        Self::remove_entry_dir(&entry, cache_id).await;
         state.cache_entries.remove(cache_id);
         notify.notify_waiters();
 
@@ -664,15 +716,38 @@ impl FileCacheBackend {
             }
         }
 
+        let mmap = entry.mmap_bytes();
+        tracing::debug!(
+            cache_id,
+            reason = ?counter,
+            cached_bytes = released,
+            mmap_bytes = mmap,
+            "evicted cache entry"
+        );
         EvictedBytes {
             disk: released,
-            mmap: entry.mmap_bytes(),
+            mmap,
+        }
+    }
+
+    /// Best-effort: a leftover directory has no meta.bin after eviction, so
+    /// the next startup discards it.
+    async fn remove_entry_dir(entry: &CacheEntry, cache_id: &str) {
+        match tokio::fs::remove_dir_all(&entry.paths.dir).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => tracing::warn!(
+                cache_id,
+                dir = %entry.paths.dir.display(),
+                %err,
+                "failed to remove evicted cache entry directory"
+            ),
         }
     }
 
     async fn eviction_inner_for(state: &BackendState, options: &FileCacheBackendOptions) {
         let disk = Self::capture_disk_pressure(options);
-        let (mut disk_remaining, mut mmap_remaining) = {
+        let (disk_target, mmap_target, current_bytes, mmap_bytes) = {
             let _pressure_guard = state.pressure_lock.lock();
             let capacity = state.capacity_bytes.load(Ordering::Relaxed);
             let current_bytes = state.current_bytes.load(Ordering::Relaxed);
@@ -682,18 +757,53 @@ impl FileCacheBackend {
             (
                 Self::pressure_evict_target(capacity, current_bytes, disk),
                 mmap_bytes.saturating_sub(Self::mmap_water_mark(mmap_capacity)),
+                current_bytes,
+                mmap_bytes,
             )
         };
+        let mut disk_remaining = disk_target;
+        let mut mmap_remaining = mmap_target;
 
         if disk_remaining > 0 || mmap_remaining > 0 {
+            let mut evicted_entries = 0usize;
             for cache_id in Self::evictable_cache_ids_by_lru(state) {
                 if disk_remaining == 0 && mmap_remaining == 0 {
                     break;
                 }
                 let evicted =
                     Self::evict_entry(state, options, &cache_id, EvictionCounter::Global).await;
+                // Every removed entry has a non-empty mapping.
+                if evicted.mmap > 0 {
+                    evicted_entries += 1;
+                }
                 disk_remaining = disk_remaining.saturating_sub(evicted.disk);
                 mmap_remaining = mmap_remaining.saturating_sub(evicted.mmap);
+            }
+            // Skip passes that removed nothing, so a target that stays out of
+            // reach is reported when idle entries run out, not every period.
+            if evicted_entries > 0 {
+                tracing::debug!(
+                    evicted_entries,
+                    disk_target,
+                    mmap_target,
+                    disk_remaining,
+                    mmap_remaining,
+                    cached_bytes = current_bytes,
+                    mmap_bytes,
+                    disk_evict_bytes = disk.evict_bytes,
+                    "file cache eviction pass finished"
+                );
+                if disk_remaining > 0 || mmap_remaining > 0 {
+                    tracing::warn!(
+                        disk_remaining,
+                        mmap_remaining,
+                        cached_bytes = state.current_bytes.load(Ordering::Relaxed),
+                        mmap_bytes = state.mmap_bytes.load(Ordering::Relaxed),
+                        "file cache eviction ran out of idle entries before reaching its target; \
+                         remaining usage is held by open files, refills, returned buffers, \
+                         or non-cache disk usage"
+                    );
+                }
             }
         }
 
@@ -1017,7 +1127,19 @@ impl FileCacheBackend {
         new_entry.dirty.store(true, Ordering::Relaxed);
         // NOTE: we do not care about block_states, since we check the open_count is zero
 
-        let _ = new_entry.checkpoint().await;
+        let _ = new_entry.checkpoint().await.inspect_err(|err| {
+            tracing::warn!(
+                cache_id = %new_id,
+                ?err,
+                "failed to checkpoint renamed cache entry"
+            )
+        });
+        tracing::debug!(
+            old_cache_id = %old_id,
+            new_cache_id = %new_id,
+            source_size,
+            "renamed cache entry"
+        );
         self.state
             .cache_entries
             .insert(new_id, CacheSlot::Active(new_entry));
@@ -1209,7 +1331,15 @@ impl FileCacheBackend {
                         let entry = entry.clone();
                         let old_size = entry.source_size.load(Ordering::Relaxed);
                         if source_size > old_size {
-                            let _ = entry.set_source_size(source_size);
+                            let _ = entry.set_source_size(source_size).inspect_err(|err| {
+                                tracing::warn!(
+                                    cache_id,
+                                    old_size,
+                                    new_size = source_size,
+                                    ?err,
+                                    "keeping cached size for cache entry"
+                                )
+                            });
                         }
                         entry.open_count.fetch_add(1, Ordering::SeqCst);
                         return Ok(entry);
@@ -1235,6 +1365,12 @@ impl FileCacheBackend {
                 paths,
                 self.state.mmap_bytes.clone(),
             )?;
+            tracing::debug!(
+                cache_id,
+                source_size,
+                mmap_bytes = cache_entry.mmap_bytes(),
+                "created cache entry"
+            );
             let slot_ref = self
                 .state
                 .cache_entries
@@ -1379,7 +1515,12 @@ impl FileCacheBackend {
         };
         let released = match entry.evict_all_blocks().await {
             Ok(bytes) => bytes,
-            Err(_) => {
+            Err(err) => {
+                tracing::warn!(
+                    cache_id,
+                    ?err,
+                    "failed to recycle cache entry; keeping it active"
+                );
                 if let Some(mut slot_ref) = self.state.cache_entries.get_mut(cache_id) {
                     *slot_ref.value_mut() = CacheSlot::Active(entry);
                 }
@@ -1387,10 +1528,16 @@ impl FileCacheBackend {
                 return 0;
             }
         };
-        let _ = tokio::fs::remove_dir_all(&entry.paths.dir).await;
+        Self::remove_entry_dir(&entry, cache_id).await;
         self.state.cache_entries.remove(cache_id);
         notify.notify_waiters();
         self.subtract_current_bytes(released);
+        tracing::debug!(
+            cache_id,
+            cached_bytes = released,
+            mmap_bytes = entry.mmap_bytes(),
+            "recycled cache entry"
+        );
         released
     }
 }

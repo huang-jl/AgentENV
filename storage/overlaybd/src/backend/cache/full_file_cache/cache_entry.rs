@@ -18,6 +18,7 @@ use zerocopy::U64;
 use super::super::meta::{
     fsync, now_unix_nanos, BlockLoadState, CacheMetaDisk, CacheMetaDiskHeader, EntryPaths,
 };
+use super::super::PAGE_SIZE;
 use super::cache_pool::FileCacheBackendOptions;
 use crate::sys;
 use storage_util::MMapRegion;
@@ -25,9 +26,21 @@ use storage_util::MMapRegion;
 // Query once for all cache pools. The host page size can differ from the
 // cache's 4 KiB block alignment (e.g. 16 KiB on native Apple Silicon macOS).
 static MMAP_PAGE_SIZE: LazyLock<u64> = LazyLock::new(|| {
-    // POSIX guarantees a positive page size on Linux and macOS.
     // SAFETY: sysconf has no pointer arguments or additional preconditions.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    // sysconf reports failure as -1. Fall back to the cache block alignment
+    // rather than rounding every mapping up to u64::MAX.
+    match u64::try_from(raw) {
+        Ok(page_size) if page_size > 0 => page_size,
+        _ => {
+            tracing::warn!(
+                page_size = raw,
+                fallback = PAGE_SIZE,
+                "invalid host page size; using cache block alignment for mmap accounting"
+            );
+            PAGE_SIZE
+        }
+    }
 });
 
 /// The core per-cache-entry object. One per remote file (keyed by cache_id).
