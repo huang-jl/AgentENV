@@ -2300,7 +2300,9 @@ async fn test_mmap_stats_count_sparse_files_and_reused_handles() {
 }
 
 #[tokio::test]
-async fn test_mmap_stats_follow_bytes_after_eviction() {
+async fn test_mmap_eviction_waits_for_last_bytes_clone() {
+    use super::full_file_cache::cache_pool::CacheSlot;
+
     let tmp = tempdir().expect("create tempdir");
     let backend = FileCacheBackend::with_options(test_options(tmp.path()))
         .await
@@ -2317,19 +2319,34 @@ async fn test_mmap_stats_follow_bytes_after_eviction() {
     let mapped = backend.stats().mmap_bytes;
     assert!(mapped >= 4096);
     drop(file);
-    backend.evict_global().await.expect("evict");
+
+    // Drive eviction on this single-thread runtime until it waits for the
+    // read permit held by Bytes. No spawned task or timing-based sleep needed.
+    let eviction = backend.evict_global();
+    tokio::pin!(eviction);
+    assert!(futures_util::poll!(eviction.as_mut()).is_pending());
+    let cache_id = super::cache_key_digest("held-bytes");
+    assert!(matches!(
+        backend.state.cache_entries.get(&cache_id).unwrap().value(),
+        CacheSlot::Evicting(_)
+    ));
+    assert_eq!(backend.stats().mmap_bytes, mapped);
+    assert_eq!(bytes.as_ref(), &[0x5a; 4096]);
+
+    drop(bytes);
+    assert!(futures_util::poll!(eviction.as_mut()).is_pending());
+    assert_eq!(backend.stats().mmap_bytes, mapped);
+    assert_eq!(other_bytes.as_ref(), &[0x5a; 4096]);
+
+    drop(other_bytes);
+    tokio::time::timeout(Duration::from_secs(5), eviction)
+        .await
+        .expect("eviction did not finish after releasing all Bytes")
+        .expect("evict");
     let stats = backend.stats();
     assert_eq!(stats.entries, 0);
     assert_eq!(stats.bytes_used, 0);
-    assert_eq!(stats.mmap_bytes, mapped);
-
-    // The accounting must also survive the backend, without retaining it.
-    let total = backend.state.mmap_bytes.clone();
-    drop(backend);
-    drop(bytes);
-    assert_eq!(total.load(Ordering::Relaxed), mapped);
-    drop(other_bytes);
-    assert_eq!(total.load(Ordering::Relaxed), 0);
+    assert_eq!(stats.mmap_bytes, 0);
 }
 
 #[tokio::test]

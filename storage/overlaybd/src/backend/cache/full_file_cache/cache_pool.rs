@@ -724,7 +724,15 @@ impl FileCacheBackend {
         }
         let released = match entry.evict_all_blocks().await {
             Ok(bytes) => bytes,
-            Err(_) => return 0,
+            Err(err) => {
+                tracing::error!(
+                    cache_id,
+                    reason = ?counter,
+                    ?err,
+                    "failed to evict cached blocks from open entry"
+                );
+                return 0;
+            }
         };
         if released > 0 {
             Self::subtract_current_bytes_for(state, options, released);
@@ -842,6 +850,10 @@ impl FileCacheBackend {
 
         if disk_remaining > 0 || mmap_remaining > 0 {
             let mut evicted_entries = 0usize;
+            let mut evicted_disk_bytes = 0u64;
+            let mut removed_mmap_bytes = 0u64;
+            let mut cleared_open_entries = 0usize;
+            let mut cleared_open_disk_bytes = 0u64;
             for cache_id in Self::evictable_cache_ids_by_lru(state) {
                 if disk_remaining == 0 && mmap_remaining == 0 {
                     break;
@@ -852,45 +864,21 @@ impl FileCacheBackend {
                 if evicted.mmap > 0 {
                     evicted_entries += 1;
                 }
+                evicted_disk_bytes = evicted_disk_bytes.saturating_add(evicted.disk);
+                // Mapping credit for removed entries, not necessarily unmapped yet.
+                removed_mmap_bytes = removed_mmap_bytes.saturating_add(evicted.mmap);
                 disk_remaining = disk_remaining.saturating_sub(evicted.disk);
                 mmap_remaining = mmap_remaining.saturating_sub(evicted.mmap);
             }
-            // Skip passes that removed nothing, so a target that stays out of
-            // reach is reported when idle entries run out, not every period.
-            if evicted_entries > 0 {
-                tracing::debug!(
-                    evicted_entries,
-                    disk_target,
-                    mmap_target,
-                    disk_remaining,
-                    mmap_remaining,
-                    cached_bytes = current_bytes,
-                    mmap_bytes,
-                    disk_evict_bytes = disk.evict_bytes,
-                    "file cache eviction pass finished"
-                );
-                if disk_remaining > 0 || mmap_remaining > 0 {
-                    tracing::warn!(
-                        disk_remaining,
-                        mmap_remaining,
-                        cached_bytes = state.current_bytes.load(Ordering::Relaxed),
-                        mmap_bytes = state.mmap_bytes.load(Ordering::Relaxed),
-                        "file cache eviction ran out of idle entries before reaching its target; \
-                         remaining usage is held by open files, refills, returned buffers, \
-                         or non-cache disk usage"
-                    );
-                }
-            }
-
             // Tier 2: entries held open but idle give up their cached blocks.
             // The entry survives so open files keep working and refill on
             // their next read.
-            if actual_evict > 0 && !options.open_evict_idle.is_zero() {
+            if disk_remaining > 0 && !options.open_evict_idle.is_zero() {
                 let idle_nanos =
                     u64::try_from(options.open_evict_idle.as_nanos()).unwrap_or(u64::MAX);
                 let idle_cutoff = now_unix_nanos().saturating_sub(idle_nanos);
                 for cache_id in Self::idle_open_cache_ids_by_lru(state, idle_cutoff) {
-                    if actual_evict == 0 {
+                    if disk_remaining == 0 {
                         break;
                     }
                     let bytes = Self::evict_open_entry_blocks(
@@ -900,7 +888,44 @@ impl FileCacheBackend {
                         EvictionCounter::Global,
                     )
                     .await;
-                    actual_evict = actual_evict.saturating_sub(bytes);
+                    if bytes > 0 {
+                        cleared_open_entries += 1;
+                        cleared_open_disk_bytes = cleared_open_disk_bytes.saturating_add(bytes);
+                    }
+                    disk_remaining = disk_remaining.saturating_sub(bytes);
+                }
+            }
+
+            // Report after both tiers, including passes that only cleared open
+            // entries. Skip passes with no progress to avoid periodic log spam.
+            if evicted_entries > 0 || cleared_open_entries > 0 {
+                tracing::debug!(
+                    evicted_entries,
+                    evicted_disk_bytes,
+                    removed_mmap_bytes,
+                    cleared_open_entries,
+                    cleared_open_disk_bytes,
+                    disk_target,
+                    mmap_target,
+                    disk_remaining,
+                    mmap_remaining,
+                    initial_cached_bytes = current_bytes,
+                    initial_mmap_bytes = mmap_bytes,
+                    cached_bytes = state.current_bytes.load(Ordering::Relaxed),
+                    mmap_bytes = state.mmap_bytes.load(Ordering::Relaxed),
+                    disk_evict_bytes = disk.evict_bytes,
+                    "file cache eviction pass finished"
+                );
+                if disk_remaining > 0 || mmap_remaining > 0 {
+                    tracing::warn!(
+                        disk_remaining,
+                        mmap_remaining,
+                        cached_bytes = state.current_bytes.load(Ordering::Relaxed),
+                        mmap_bytes = state.mmap_bytes.load(Ordering::Relaxed),
+                        "file cache eviction did not reach its target after both tiers; \
+                         remaining usage may be held by protected entries or mappings, \
+                         non-cache disk usage, or failed evictions"
+                    );
                 }
             }
         }
@@ -1677,7 +1702,9 @@ mod tests {
         .unwrap();
         large.write_block(0, &vec![0x5a; page as usize]).unwrap();
         state.current_bytes.store(page, Ordering::Relaxed);
-        let bytes = large.read_block(0).unwrap().unwrap();
+        // Keep the mapping alive without a cached read's eviction read permit:
+        // this test isolates mapping-budget accounting from reader protection.
+        let mapping = large.mem_region.clone();
         large.last_access_nanos.store(1, Ordering::Relaxed);
         state
             .cache_entries
@@ -1696,9 +1723,14 @@ mod tests {
             .cache_entries
             .insert("small".into(), CacheSlot::Active(small));
 
-        FileCacheBackend::eviction_inner_for(&state, &options).await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            FileCacheBackend::eviction_inner_for(&state, &options),
+        )
+        .await
+        .expect("first eviction pass timed out");
         // Retiring the 4-page entry covers this pass's mapping budget, even
-        // though returned Bytes keep its mapping live. Leave the small entry.
+        // though the mapping clone keeps it live. Leave the small entry.
         assert!(!state.cache_entries.contains_key("large"));
         assert!(state.cache_entries.contains_key("small"));
         assert_eq!(state.current_bytes.load(Ordering::Relaxed), 0);
@@ -1706,11 +1738,16 @@ mod tests {
         assert!(!state.is_full.load(Ordering::Relaxed));
 
         // The next pass starts from actual usage and can reclaim the small
-        // entry. It ends when candidates run out, without waiting for readers.
-        FileCacheBackend::eviction_inner_for(&state, &options).await;
+        // entry. It ends when candidates run out, despite the retained mapping.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            FileCacheBackend::eviction_inner_for(&state, &options),
+        )
+        .await
+        .expect("second eviction pass timed out");
         assert!(state.cache_entries.is_empty());
         assert_eq!(state.mmap_bytes.load(Ordering::Relaxed), 4 * page);
-        drop(bytes);
+        drop(mapping);
         assert_eq!(state.mmap_bytes.load(Ordering::Relaxed), 0);
     }
 }
