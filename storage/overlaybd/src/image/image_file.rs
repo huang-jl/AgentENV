@@ -692,13 +692,6 @@ impl ImageFile {
             .store(size / u64::from(self.block_size), Ordering::Relaxed);
     }
 
-    async fn refresh_size_metadata(&self) -> Result<u64> {
-        let state = self.state.read().await;
-        let size = Self::base_size(&state.base).await?;
-        self.update_size_metadata(size);
-        Ok(size)
-    }
-
     async fn open_ro_remote(
         image_service: &ImageService,
         repo_blob_url: &str,
@@ -815,7 +808,7 @@ impl VirtualFile for ImageFile {
             .context("writing read-only image file")?
             .write_at(offset, data)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(written)
     }
 
@@ -875,7 +868,7 @@ impl VirtualFile for ImageFile {
                 .context("writing read-only image file")?
                 .write_at_with_ctx(ctx, offset, data)
                 .await?;
-            self.refresh_size_metadata().await?;
+            self.update_size_metadata(Self::base_size(&state.base).await?);
             Ok(written)
         })
     }
@@ -895,7 +888,7 @@ impl VirtualFile for ImageFile {
                 .context("writing read-only image file")?
                 .write_bytes_at_with_ctx(ctx, offset, data)
                 .await?;
-            self.refresh_size_metadata().await?;
+            self.update_size_metadata(Self::base_size(&state.base).await?);
             Ok(written)
         })
     }
@@ -908,12 +901,15 @@ impl VirtualFile for ImageFile {
             .context("discarding read-only image file")?
             .discard(offset, len)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(())
     }
 
     async fn size(&self) -> Result<u64> {
-        self.refresh_size_metadata().await
+        let state = self.state.read().await;
+        let size = Self::base_size(&state.base).await?;
+        self.update_size_metadata(size);
+        Ok(size)
     }
 
     async fn truncate(&self, size: u64) -> Result<()> {
@@ -924,7 +920,7 @@ impl VirtualFile for ImageFile {
             .context("truncating read-only image file")?
             .truncate(size)
             .await?;
-        self.refresh_size_metadata().await?;
+        self.update_size_metadata(Self::base_size(&state.base).await?);
         Ok(())
     }
 
@@ -1978,6 +1974,96 @@ mod tests {
             .await
             .expect("open image");
         (image, upper_data)
+    }
+
+    struct PausedWriteFile {
+        inner: LocalFile,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        pause_next: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl VirtualFile for PausedWriteFile {
+        async fn read_at(&self, offset: u64, len: usize) -> Result<Bytes> {
+            self.inner.read_at(offset, len).await
+        }
+
+        async fn write_at(&self, offset: u64, data: &[u8]) -> Result<usize> {
+            if self.pause_next.swap(false, AtomicOrdering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.write_at(offset, data).await
+        }
+
+        async fn size(&self) -> Result<u64> {
+            self.inner.size().await
+        }
+
+        async fn sync(&self) -> Result<()> {
+            self.inner.sync().await
+        }
+    }
+
+    #[tokio::test]
+    async fn test_write_at_completes_with_restack_waiting_for_state_lock() {
+        let tmp = TempDir::new().expect("tempdir");
+        let (image, upper_data) = hybrid_image_without_lowers(&tmp, 1 << 20).await;
+        let data = Arc::new(PausedWriteFile {
+            inner: LocalFile::open_rw(&upper_data, false).expect("open upper data"),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            pause_next: std::sync::atomic::AtomicBool::new(false),
+        });
+        {
+            let mut state = image.state.write().await;
+            let index: Arc<dyn VirtualFile> = Arc::new(
+                LocalFile::open_rw(&state.config.upper.index, false).expect("open upper index"),
+            );
+            state.base = ImageFileBase::ReadWrite(
+                open_file_rw(data.clone(), Some(index))
+                    .await
+                    .expect("reopen upper with paused writes"),
+            );
+        }
+        data.pause_next.store(true, AtomicOrdering::SeqCst);
+
+        let payload = [0xAB; 4096];
+        let write = image.write_at(0, &payload);
+        tokio::pin!(write);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                result = &mut write => panic!("write completed before the gate: {result:?}"),
+                _ = data.entered.notified() => {}
+            }
+        })
+        .await
+        .expect("write must reach the bottom file while holding the state read lock");
+
+        let output = tmp.path().join("snapshot.commit");
+        let snapshot = image.create_snapshot_and_restack(&output);
+        tokio::pin!(snapshot);
+        // Polling, rather than spawning and sleeping, guarantees that the writer
+        // is queued before the blocked I/O is released.
+        assert!(futures_util::poll!(&mut snapshot).is_pending());
+        assert!(
+            image.state.try_read().is_err(),
+            "snapshot must queue a writer"
+        );
+        data.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (written, sealed) = tokio::join!(&mut write, &mut snapshot);
+            assert_eq!(written.expect("write completes"), payload.len());
+            sealed.expect("restack completes");
+        })
+        .await
+        .expect("write and restack deadlocked while refreshing size metadata");
+        assert_eq!(
+            image.read_at(0, payload.len()).await.unwrap().as_ref(),
+            payload
+        );
     }
 
     /// The property that makes sealing affordable: the upper *becomes* the layer.
